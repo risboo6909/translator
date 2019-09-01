@@ -94,7 +94,7 @@ func fetchWithBackOff(url string, r requestCtx) ([]byte, error) {
 		if err != nil {
 
 			log.Printf("Can't get translation for '%s' from %s to %s, reason: %v, retry in %d seconds",
-				r.data, r.from, r.to, err, 5)
+				r.data, r.from, r.to, err, retryDelay)
 
 			time.Sleep(retryDelay * time.Second)
 			retryDelay *= 2
