@@ -1,15 +1,11 @@
 package main
 
-import (
-	"fmt"
-)
-
 // Service is a Translator user.
 type Service struct {
 	translator Translator
 }
 
-func NewService() *Service {
+func NewService(url string, formatter func(key requestCtx) string, cacheSizeBytes, cacheEntryExpireSec int) *Service {
 	//t := newRandomTranslator(
 	//	100*time.Millisecond,
 	//	500*time.Millisecond,
@@ -17,8 +13,6 @@ func NewService() *Service {
 	//)
 
 	return &Service{
-		translator: newTranslator("http://localhost:33333", func(key requestCtx) string {
-			return fmt.Sprintf("from=%s&to=%s&text=%s", key.from, key.to, key.data)
-		}, 10000),
+		translator: newTranslator(url, formatter, cacheSizeBytes, cacheEntryExpireSec),
 	}
 }

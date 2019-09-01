@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"io/ioutil"
 	"log"
 	"net/http"
@@ -10,7 +11,7 @@ import (
 
 	"golang.org/x/text/language"
 
-	"github.com/hashicorp/golang-lru"
+	"github.com/coocood/freecache"
 	"github.com/pkg/errors"
 )
 
@@ -21,18 +22,23 @@ type requestCtx struct {
 	data     string
 }
 
+func (c requestCtx) asBytes() []byte {
+	return []byte(fmt.Sprintf("%s-%s-%s", c.from, c.to, c.data))
+}
+
 type result struct {
-	text string
+	body []byte
 	err  error
 }
 
 type MyTranslator struct {
-	url           string
-	paramsBuilder func(key requestCtx) string
+	url       string
+	formatter func(key requestCtx) string
 
 	// there is no mention in problem description that backend may be scaled in future
 	// therefor I suppose it runs as a single process on one machine and no external in-memory cache is needed
-	cache *lru.ARCCache
+	cache               *freecache.Cache
+	cacheEntryExpireSec int
 
 	// queue to avoid many duplicate requests at once
 	inProgress map[requestCtx][]chan result
@@ -40,17 +46,17 @@ type MyTranslator struct {
 	m sync.Mutex
 }
 
-func newTranslator(url string, paramsBuilder func(key requestCtx) string, cacheCapacity int) *MyTranslator {
-	c, _ := lru.NewARC(cacheCapacity)
+func newTranslator(url string, formatter func(key requestCtx) string, cacheSizeBytes, cacheEntryExpireSec int) *MyTranslator {
 	return &MyTranslator{
-		url:           url,
-		paramsBuilder: paramsBuilder,
-		cache:         c,
-		inProgress:    make(map[requestCtx][]chan result),
+		url:                 url,
+		formatter:           formatter,
+		cache:               freecache.NewCache(cacheSizeBytes),
+		cacheEntryExpireSec: cacheEntryExpireSec,
+		inProgress:          make(map[requestCtx][]chan result),
 	}
 }
 
-func doFetch(url string, timeout time.Duration) (string, error) {
+func doFetch(url string, timeout time.Duration) ([]byte, error) {
 
 	client := http.Client{
 		Timeout: timeout,
@@ -58,37 +64,37 @@ func doFetch(url string, timeout time.Duration) (string, error) {
 
 	resp, err := client.Get(url)
 	if err != nil {
-		return "", errors.Wrap(err, "error in doFetch")
+		return nil, errors.Wrap(err, "error in doFetch")
 	}
 
 	defer resp.Body.Close()
 
 	body, err := ioutil.ReadAll(resp.Body)
 	if err != nil {
-		return "", errors.Wrap(err, "error in doFetch")
+		return nil, errors.Wrap(err, "error in doFetch")
 	}
 
-	return string(body), nil
+	return body, nil
 
 }
 
-func fetchWithBackOff(url string, key requestCtx) (string, error) {
+func fetchWithBackOff(url string, r requestCtx) ([]byte, error) {
 
 	var (
 		retryDelay time.Duration = 1
-		timeout    time.Duration = time.Second
-		resp       string
+		timeout    time.Duration = 1
+		resp       []byte
 		err        error
 	)
 
 	for retryDelay <= maxRetriesDelaySec {
 
-		resp, err = doFetch(url, timeout)
+		resp, err = doFetch(url, timeout*time.Second)
 
 		if err != nil {
 
 			log.Printf("Can't get translation for '%s' from %s to %s, reason: %v, retry in %d seconds",
-				key.data, key.from, key.to, err, 5)
+				r.data, r.from, r.to, err, 5)
 
 			time.Sleep(retryDelay * time.Second)
 			retryDelay *= 2
@@ -103,7 +109,7 @@ func fetchWithBackOff(url string, key requestCtx) (string, error) {
 	}
 
 	if err != nil {
-		return "", errors.Errorf("Unable to translate '%s' from %s to %s", key.data, key.from, key.to)
+		return nil, errors.Errorf("Unable to translate '%s' from %s to %s", r.data, r.from, r.to)
 	}
 
 	return resp, nil
@@ -112,9 +118,10 @@ func fetchWithBackOff(url string, key requestCtx) (string, error) {
 
 func (t *MyTranslator) worker(key requestCtx) {
 
-	resp, err := fetchWithBackOff(t.url+"?"+t.paramsBuilder(key), key)
+	resp, err := fetchWithBackOff(t.url+"?"+t.formatter(key), key)
+	// don't update cache in case of any error to avoid invalid results until cache expiration
 	if err == nil {
-		t.cache.Add(key, resp)
+		t.cache.Set(key.asBytes(), resp, t.cacheEntryExpireSec)
 	}
 
 	// get all consumers waiting for translation
@@ -126,7 +133,7 @@ func (t *MyTranslator) worker(key requestCtx) {
 	// send response to all consumers
 	for _, c := range consumers {
 		c <- result{
-			text: resp,
+			body: resp,
 			err:  err,
 		}
 	}
@@ -156,9 +163,9 @@ func (t *MyTranslator) Translate(ctx context.Context, from, to language.Tag, dat
 
 	k := requestCtx{from, to, data}
 
-	translated, found := t.cache.Get(k)
-	if found {
-		return translated.(string), nil
+	translated, err := t.cache.Get(k.asBytes())
+	if err == nil {
+		return string(translated), nil
 	}
 
 	r := <-t.enqueue(k)
@@ -167,5 +174,5 @@ func (t *MyTranslator) Translate(ctx context.Context, from, to language.Tag, dat
 		return "", r.err
 	}
 
-	return r.text, nil
+	return string(r.body), nil
 }
